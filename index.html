@@ -290,6 +290,16 @@ const CFG = {
   </button>
 </div>
 
+<!-- REAUTH OVERLAY -->
+<div id="reauthOverlay" style="display:none;position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.5);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);align-items:center;justify-content:center;padding:32px;">
+  <div style="background:#fff;border-radius:20px;padding:28px 24px;max-width:320px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3)">
+    <div style="font-size:36px;margin-bottom:12px">🔐</div>
+    <div style="font-size:18px;font-weight:700;color:#1c1c1e;margin-bottom:8px">Сессия истекла</div>
+    <div style="font-size:14px;color:#6d6d72;margin-bottom:24px">Нажмите для быстрого входа</div>
+    <button onclick="quickReAuth()" style="width:100%;padding:14px;background:#007aff;color:#fff;border:none;border-radius:12px;font-size:16px;font-weight:600;cursor:pointer;font-family:inherit">🔑 Войти снова</button>
+  </div>
+</div>
+
 <!-- LOADING -->
 <div class="loading-overlay hidden" id="loadingOverlay">
   <div class="big-spinner"></div>
@@ -350,6 +360,7 @@ let expenses = {}; // {name: {sum, checked}}
 let otherExp = {}; // {name: sum}
 let envelopeExpense = 0;
 let envelopeReason = '';
+let envelopeSheetTotal = 0; // total from sheet (formula result)
 let kassaIncome = 0;
 let kassaOpen = 0;
 let isFirstDay = false;
@@ -382,10 +393,41 @@ function signIn(){
 
 function signOut(){
   accessToken = null;
+  try{localStorage.removeItem('so_token_exp');}catch(e){}
   g('loginScreen').style.display = 'flex';
   g('mainHeader').style.display = 'none';
   g('mainScroll').style.display = 'none';
   g('saveBar').style.display = 'none';
+}
+
+function showReAuth(){
+  g('reauthOverlay').style.display = 'flex';
+}
+
+function quickReAuth(){
+  g('reauthOverlay').style.display = 'none';
+  const client = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/userinfo.profile',
+    callback: async (resp) => {
+      if(resp.error){ showToast('Ошибка входа', 'error'); showReAuth(); return; }
+      accessToken = resp.access_token;
+      try{ localStorage.setItem('so_token_exp', Date.now() + (resp.expires_in||3600)*1000); }catch(e){}
+      showToast('✅ Вход выполнен!', 'success');
+      // Reload current tab data
+      loadSheetAndRender();
+    }
+  });
+  client.requestAccessToken();
+}
+
+// Check token before API calls
+async function checkAuth(){
+  if(!accessToken){
+    showReAuth();
+    return false;
+  }
+  return true;
 }
 
 function tryAutoSignIn(){
@@ -431,6 +473,7 @@ function initState(){
   OTHER_EXPENSES.forEach(n => otherExp[n] = '');
   envelopeExpense = '';
   envelopeReason = '';
+  envelopeSheetTotal = 0;
   kassaIncome = '';
   kassaOpen = '';
 
@@ -479,8 +522,12 @@ async function loadSheetAndRender(){
     renderForm();
   } catch(e) {
     hideLoading();
-    showToast('Ошибка загрузки: ' + e.message, 'error');
-    renderForm();
+    if(e.message && (e.message.includes('401') || e.message.includes('403'))){
+      showReAuth();
+    } else {
+      showToast('Ошибка загрузки: ' + e.message, 'error');
+      renderForm();
+    }
   }
 }
 
@@ -526,7 +573,7 @@ async function autoFillKassaOpen(){
 
     if(lastBalance !== null){
       // Round to 2 decimal places to fix floating point issue
-      kassaOpen = Math.round(parseFloat(lastBalance) * 100) / 100;
+      kassaOpen = Math.round(parseFloat(String(lastBalance).replace(',','.')) * 100) / 100;
       showToast('💰 Вход: €' + fv(kassaOpen) + ' из «' + prevSn + '»', 'success');
       // Force re-render to show the value
       setTimeout(renderForm, 100);
@@ -609,8 +656,10 @@ function renderForm(){
         envelopeRow = r;
         const existExp    = (sheetData[r]||[])[eExp];
         const existReason = (sheetData[r]||[])[eReas];
-        if(existExp    !== undefined && existExp    !== '' && existExp    !== 0) envelopeExpense = existExp;
+        const existTotal  = (sheetData[r]||[])[eTotal];
+        if(existExp   !== undefined && existExp   !== '' && existExp   !== 0) envelopeExpense = existExp;
         if(existReason !== undefined && existReason !== '') envelopeReason = existReason;
+        if(existTotal !== undefined && existTotal !== '') envelopeSheetTotal = parseFloat(String(existTotal).replace(',','.')) || 0;
       } else if(envelopeRow === null){
         // Accumulate previous day total
         const tot = (sheetData[r]||[])[eTotal];
@@ -681,7 +730,9 @@ function renderForm(){
   // ENVELOPE
   const envExpVal = envelopeExpense||'';
   const envReasonVal = envelopeReason||'';
-  const envTotal = envFromChecked - parseFloat(String(envelopeExpense||0).replace(',','.'));
+  // Use sheet total if available (formula result), otherwise calculate
+  const envCalc = envFromChecked - parseFloat(String(envelopeExpense||0).replace(',','.'));
+  const envTotal = envelopeSheetTotal > 0 ? envelopeSheetTotal : envCalc;
 
   html += `<div class="sec">Конверт</div>
   <div class="card">
@@ -945,7 +996,11 @@ async function saveData(){
 
   } catch(e) {
     hideLoading();
-    showToast('❌ Ошибка: ' + e.message, 'error');
+    if(e.message && (e.message.includes('401') || e.message.includes('403') || e.message.includes('credentials'))){
+      showReAuth();
+    } else {
+      showToast('❌ Ошибка: ' + e.message, 'error');
+    }
     console.error(e);
   } finally {
     btn.disabled = false;
